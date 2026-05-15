@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+import {
+  back as historyBack,
+  forward as historyForward,
+  record as recordHistory,
+} from "./history.mjs";
 import { PDFViewerApplicationOptions } from "./pdf.js/web/viewer.mjs";
 
 function loadConfig() {
@@ -49,9 +54,93 @@ document.addEventListener(
   true
 );
 
+// Inject the back/forward toolbar buttons and wire up the navigation history.
+// History entries are recorded around internal-link navigation so the user can
+// jump back to where a link was followed from (and forward again).
+function setupHistoryNavigation() {
+  const app = window.PDFViewerApplication;
+
+  // Record a baseline entry once the document is laid out.
+  app.eventBus.on("pagesloaded", () => recordHistory());
+
+  // Wrap the link-service navigation methods so that the position the user
+  // navigated *from* is captured before the jump, and the destination is
+  // captured once scrolling settles (so "forward" has a target).
+  const linkService = app.pdfLinkService;
+  for (const method of ["goToDestination", "goToPage", "setHash"]) {
+    const original = linkService[method].bind(linkService);
+    linkService[method] = (...args) => {
+      recordHistory();
+      const result = original(...args);
+      Promise.resolve(result).finally(() => {
+        setTimeout(() => recordHistory(), 400);
+      });
+      return result;
+    };
+  }
+
+  // Toolbar buttons, inserted next to the page previous/next controls.
+  const template = document.createElement("template");
+  template.innerHTML = /* html */ `
+    <div class="toolbarHorizontalGroup hiddenSmallView">
+      <button class="toolbarButton" type="button" title="Go Back" id="historyBack" tabindex="0">
+        <span>Back</span>
+      </button>
+      <div class="splitToolbarButtonSeparator"></div>
+      <button class="toolbarButton" type="button" title="Go Forward" id="historyForward" tabindex="0">
+        <span>Forward</span>
+      </button>
+    </div>
+    <div class="toolbarButtonSpacer"></div>`;
+  const pageNavGroup = document
+    .getElementById("previous")
+    ?.closest(".toolbarHorizontalGroup");
+  if (pageNavGroup?.parentNode) {
+    for (const node of [...template.content.childNodes]) {
+      pageNavGroup.parentNode.insertBefore(node, pageNavGroup);
+    }
+  }
+  document
+    .getElementById("historyBack")
+    ?.addEventListener("click", () => historyBack());
+  document
+    .getElementById("historyForward")
+    ?.addEventListener("click", () => historyForward());
+
+  // Keyboard: Alt/Cmd + Left/Right. Ignored while typing in a field.
+  document.addEventListener("keydown", (e) => {
+    const tag = document.activeElement?.tagName;
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
+      return;
+    }
+    if (!(e.altKey || e.metaKey) || e.ctrlKey || e.shiftKey) {
+      return;
+    }
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      historyBack();
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      historyForward();
+    }
+  });
+
+  // Mouse: dedicated back (button 3) / forward (button 4) buttons.
+  window.addEventListener("mouseup", (e) => {
+    if (e.button === 3) {
+      e.preventDefault();
+      historyBack();
+    } else if (e.button === 4) {
+      e.preventDefault();
+      historyForward();
+    }
+  });
+}
+
 void (async () => {
   await window.PDFViewerApplication.initializedPromise;
   await window.PDFViewerApplication.open(config);
+  setupHistoryNavigation();
   const [, hash] = config.url.split("#");
   if (hash) {
     window.PDFViewerApplication.pdfLinkService.setHash(

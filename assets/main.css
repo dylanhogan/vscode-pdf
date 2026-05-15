@@ -17,3 +17,21 @@
 body {
   padding: 0;
 }
+
+/*
+ * Back/forward navigation button icons.
+ *
+ * Inlined as data-URI SVG masks rather than reusing pdf.js's
+ * --findbarButton-*-icon variables: those resolve their relative url() against
+ * this stylesheet (main.css) instead of viewer.css, so the referenced SVG is
+ * not found and the buttons render blank.
+ */
+#historyBack::before {
+  -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M10.5 2 L12 3.5 L7.5 8 L12 12.5 L10.5 14 L4.5 8 Z' fill='black'/></svg>");
+  mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M10.5 2 L12 3.5 L7.5 8 L12 12.5 L10.5 14 L4.5 8 Z' fill='black'/></svg>");
+}
+
+#historyForward::before {
+  -webkit-mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M5.5 2 L4 3.5 L8.5 8 L4 12.5 L5.5 14 L11.5 8 Z' fill='black'/></svg>");
+  mask-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M5.5 2 L4 3.5 L8.5 8 L4 12.5 L5.5 14 L11.5 8 Z' fill='black'/></svg>");
+}

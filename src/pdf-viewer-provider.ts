@@ -60,6 +60,11 @@ export class PDFViewerProvider implements CustomReadonlyEditorProvider {
       new PDFViewerProvider(context),
       {
         supportsMultipleEditorsPerDocument: false,
+        // Keep the webview's pdf.js state (including unsaved annotation-editor
+        // highlights/comments) alive when the tab is hidden. Without this,
+        // VS Code disposes the webview on tab switch and pdf.js reloads the
+        // PDF from scratch, dropping the user's in-memory annotations.
+        webviewOptions: { retainContextWhenHidden: true },
       }
     );
   }

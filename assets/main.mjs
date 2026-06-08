@@ -31,6 +31,22 @@ function loadConfig() {
 
 const config = loadConfig();
 
+// Cached VS Code webview API handle. `acquireVsCodeApi()` can only be called
+// once per webview, so we store it for any code that needs it.
+function getVscode() {
+  if (window.__vscode_api) {
+    return window.__vscode_api;
+  }
+  if (typeof window.acquireVsCodeApi === "function") {
+    try {
+      window.__vscode_api = window.acquireVsCodeApi();
+    } catch {
+      window.__vscode_api = null;
+    }
+  }
+  return window.__vscode_api;
+}
+
 PDFViewerApplicationOptions.set("defaultUrl", "");
 PDFViewerApplicationOptions.set("disablePreferences", true);
 PDFViewerApplicationOptions.set(
@@ -137,10 +153,47 @@ function setupHistoryNavigation() {
   });
 }
 
+// Wire pdf.js's annotation editor into VS Code's save/dirty flow:
+//   - notify the extension host whenever the user edits annotations so the
+//     tab's dirty-dot reflects unsaved changes
+//   - redirect pdf.js's own Save/Download buttons to VS Code's Save command
+//     instead of triggering a useless in-webview blob download
+function setupSavePlumbing() {
+  const app = window.PDFViewerApplication;
+  const vscode = getVscode();
+  if (!vscode) {
+    return;
+  }
+
+  // Track the annotation-storage size at each (re)load so transient editor
+  // state changes (mode toggles, etc.) don't dirty the document — only an
+  // actual change in the number of stored annotations counts. Re-baseline on
+  // every `pagesloaded` so reverts/reloads start from a clean slate.
+  let baselineSize = 0;
+  app.eventBus.on("pagesloaded", () => {
+    baselineSize = app.pdfDocument?.annotationStorage?.size ?? 0;
+  });
+  app.eventBus.on("annotationeditorstateschanged", () => {
+    const size = app.pdfDocument?.annotationStorage?.size ?? 0;
+    if (size !== baselineSize) {
+      baselineSize = size;
+      vscode.postMessage({ action: "contentChanged" });
+    }
+  });
+
+  // Route pdf.js's Save / Download actions through VS Code's save command, so
+  // ⌘S / Ctrl+S and the in-viewer Save button both end up writing to disk via
+  // the extension host (which actually has filesystem access).
+  const requestSave = () => vscode.postMessage({ action: "requestSave" });
+  app.save = requestSave;
+  app.download = requestSave;
+}
+
 void (async () => {
   await window.PDFViewerApplication.initializedPromise;
   await window.PDFViewerApplication.open(config);
   setupHistoryNavigation();
+  setupSavePlumbing();
   const [, hash] = config.url.split("#");
   if (hash) {
     window.PDFViewerApplication.pdfLinkService.setHash(
@@ -151,16 +204,35 @@ void (async () => {
 
 window.addEventListener("message", async (event) => {
   await window.PDFViewerApplication.initializedPromise;
-  const currentPageNumber =
-    window.PDFViewerApplication.pdfViewer.currentPageNumber;
+  const app = window.PDFViewerApplication;
+
   switch (event.data.action) {
-    case "reload":
-      await window.PDFViewerApplication.open(config);
-      await window.PDFViewerApplication.pdfViewer.pagesPromise;
-      window.PDFViewerApplication.pdfViewer.currentPageNumber = Math.min(
+    case "reload": {
+      const currentPageNumber = app.pdfViewer.currentPageNumber;
+      await app.open(config);
+      await app.pdfViewer.pagesPromise;
+      app.pdfViewer.currentPageNumber = Math.min(
         currentPageNumber,
-        window.PDFViewerApplication.pdfViewer.pagesCount
+        app.pdfViewer.pagesCount
       );
+      break;
+    }
+    case "getBytes": {
+      const vscode = getVscode();
+      const { requestId } = event.data;
+      try {
+        const data = await app.pdfDocument.saveDocument();
+        vscode?.postMessage({ action: "bytes", requestId, data });
+      } catch (err) {
+        vscode?.postMessage({
+          action: "bytes",
+          requestId,
+          error: String(err?.message ?? err),
+        });
+      }
+      break;
+    }
+    default:
       break;
   }
 });

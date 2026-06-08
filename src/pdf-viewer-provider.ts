@@ -16,9 +16,14 @@
 
 import { join } from "node:path";
 import {
-  type CustomReadonlyEditorProvider,
+  type CancellationToken,
+  type CustomDocumentBackup,
+  type CustomDocumentBackupContext,
+  type CustomDocumentContentChangeEvent,
+  type CustomEditorProvider,
   commands,
   type Disposable,
+  EventEmitter,
   type ExtensionContext,
   Uri,
   type Webview,
@@ -51,7 +56,12 @@ const vscodeWebviewUriPrefix = "https://file+.vscode-resource.vscode-cdn.net";
 
 const resourcePathRegex = /\/[^/]+?\.\w+$/;
 
-export class PDFViewerProvider implements CustomReadonlyEditorProvider {
+interface PendingBytesRequest {
+  reject: (error: Error) => void;
+  resolve: (bytes: Uint8Array) => void;
+}
+
+export class PDFViewerProvider implements CustomEditorProvider<PDFDocument> {
   static readonly viewType = "pdf.view";
 
   static register(context: ExtensionContext) {
@@ -60,19 +70,29 @@ export class PDFViewerProvider implements CustomReadonlyEditorProvider {
       new PDFViewerProvider(context),
       {
         supportsMultipleEditorsPerDocument: false,
-        // Keep the webview's pdf.js state (including unsaved annotation-editor
-        // highlights/comments) alive when the tab is hidden. Without this,
-        // VS Code disposes the webview on tab switch and pdf.js reloads the
-        // PDF from scratch, dropping the user's in-memory annotations.
+        // Keep the pdf.js webview (and its in-memory annotation-editor state)
+        // alive while the tab is hidden. Without this, switching tabs would
+        // drop unsaved highlights/comments.
         webviewOptions: { retainContextWhenHidden: true },
       }
     );
   }
 
-  /** Tracks all known webviews */
   private readonly webviews = new WebviewCollection();
 
   private readonly extensionRoot: Uri;
+
+  /** Outstanding `getBytes` requests awaiting a webview reply. */
+  private readonly pendingBytesRequests = new Map<
+    string,
+    PendingBytesRequest
+  >();
+  private nextRequestId = 0;
+
+  private readonly _onDidChangeCustomDocument = new EventEmitter<
+    CustomDocumentContentChangeEvent<PDFDocument>
+  >();
+  readonly onDidChangeCustomDocument = this._onDidChangeCustomDocument.event;
 
   constructor(context: ExtensionContext) {
     this.extensionRoot = Uri.file(context.extensionPath);
@@ -85,7 +105,6 @@ export class PDFViewerProvider implements CustomReadonlyEditorProvider {
 
     listeners.push(
       document.onDidChange((e) => {
-        // Update all webviews when the document changes
         for (const webviewPanel of this.webviews.get(e)) {
           webviewPanel.webview.postMessage({ action: "reload" });
         }
@@ -103,10 +122,8 @@ export class PDFViewerProvider implements CustomReadonlyEditorProvider {
   }
 
   resolveCustomEditor(document: PDFDocument, webviewPanel: WebviewPanel): void {
-    // Add the webview to our internal set of active webviews
     this.webviews.add(document.uri, webviewPanel);
 
-    // Setup initial content for the webview
     const resourceRoot = document.uri.with({
       path: document.uri.path.replace(resourcePathRegex, "/"),
     });
@@ -121,17 +138,121 @@ export class PDFViewerProvider implements CustomReadonlyEditorProvider {
     );
 
     webviewPanel.webview.onDidReceiveMessage((msg) => {
-      if ("open" in msg) {
-        const urlWithCdnScheme = msg.open as string;
-        const [file = "", hash] = urlWithCdnScheme
-          .substring(vscodeWebviewUriPrefix.length)
-          .split("#");
-        commands.executeCommand(
-          "vscode.open",
-          Uri.file(file).with({ fragment: hash ?? "" })
-        );
-      }
+      this.handleWebviewMessage(document, msg);
     });
+  }
+
+  private handleWebviewMessage(
+    document: PDFDocument,
+    msg: { [key: string]: unknown }
+  ): void {
+    if ("open" in msg) {
+      const urlWithCdnScheme = msg.open as string;
+      const [file = "", hash] = urlWithCdnScheme
+        .substring(vscodeWebviewUriPrefix.length)
+        .split("#");
+      commands.executeCommand(
+        "vscode.open",
+        Uri.file(file).with({ fragment: hash ?? "" })
+      );
+      return;
+    }
+
+    switch (msg.action) {
+      case "contentChanged":
+        this._onDidChangeCustomDocument.fire({ document });
+        break;
+      case "requestSave":
+        commands.executeCommand("workbench.action.files.save");
+        break;
+      case "bytes": {
+        const requestId = msg.requestId as string;
+        const pending = this.pendingBytesRequests.get(requestId);
+        if (!pending) {
+          return;
+        }
+        this.pendingBytesRequests.delete(requestId);
+        if (msg.error) {
+          pending.reject(new Error(String(msg.error)));
+        } else {
+          pending.resolve(new Uint8Array(msg.data as ArrayBuffer | Uint8Array));
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Ask the document's webview for the current annotated PDF bytes. Returns
+   * the bytes pdf.js would emit from `pdfDocument.saveDocument()`.
+   */
+  private requestBytes(document: PDFDocument): Promise<Uint8Array> {
+    const webviewPanel = this.firstWebviewFor(document.uri);
+    if (!webviewPanel) {
+      return Promise.reject(new Error("Cannot save: PDF viewer is not open."));
+    }
+    const requestId = String(++this.nextRequestId);
+    const bytes = new Promise<Uint8Array>((resolve, reject) => {
+      this.pendingBytesRequests.set(requestId, { resolve, reject });
+    });
+    webviewPanel.webview.postMessage({ action: "getBytes", requestId });
+    return bytes;
+  }
+
+  private firstWebviewFor(uri: Uri): WebviewPanel | undefined {
+    for (const panel of this.webviews.get(uri)) {
+      return panel;
+    }
+    return;
+  }
+
+  async saveCustomDocument(
+    document: PDFDocument,
+    _cancellation: CancellationToken
+  ): Promise<void> {
+    const bytes = await this.requestBytes(document);
+    document.suppressNextFileChange();
+    await workspace.fs.writeFile(document.uri, bytes);
+  }
+
+  async saveCustomDocumentAs(
+    document: PDFDocument,
+    destination: Uri,
+    _cancellation: CancellationToken
+  ): Promise<void> {
+    const bytes = await this.requestBytes(document);
+    await workspace.fs.writeFile(destination, bytes);
+  }
+
+  revertCustomDocument(
+    document: PDFDocument,
+    _cancellation: CancellationToken
+  ): Thenable<void> {
+    for (const panel of this.webviews.get(document.uri)) {
+      panel.webview.postMessage({ action: "reload" });
+    }
+    return Promise.resolve();
+  }
+
+  async backupCustomDocument(
+    document: PDFDocument,
+    context: CustomDocumentBackupContext,
+    _cancellation: CancellationToken
+  ): Promise<CustomDocumentBackup> {
+    const bytes = await this.requestBytes(document);
+    await workspace.fs.writeFile(context.destination, bytes);
+    return {
+      id: context.destination.toString(),
+      delete: async () => {
+        try {
+          await workspace.fs.delete(context.destination);
+        } catch {
+          // Backup already gone — fine.
+        }
+      },
+    };
   }
 
   private getHtmlForWebview(document: PDFDocument, webview: Webview): string {

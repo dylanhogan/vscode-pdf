@@ -21,11 +21,15 @@ function areUriEqual(l: Uri, r: Uri) {
   return `${l}` === `${r}`;
 }
 
-/**
- * Define the document (the data model) used for paw draw files.
- */
 export class PDFDocument extends Disposable implements CustomDocument {
   private readonly _uri: Uri;
+  /**
+   * When set, the next filesystem-change event for our URI will be swallowed
+   * rather than fired as `onDidChange`. Used after our own writes so the
+   * webview doesn't reload (and drop unsaved annotation-editor state) in
+   * response to a save we just performed.
+   */
+  private _suppressNextChange = false;
 
   constructor(uri: Uri) {
     super();
@@ -36,9 +40,14 @@ export class PDFDocument extends Disposable implements CustomDocument {
     );
 
     const onChangeHandler = (e: Uri) => {
-      if (areUriEqual(e, uri)) {
-        this._onDidChange.fire(e);
+      if (!areUriEqual(e, uri)) {
+        return;
       }
+      if (this._suppressNextChange) {
+        this._suppressNextChange = false;
+        return;
+      }
+      this._onDidChange.fire(e);
     };
 
     this._register(watcher.onDidChange(onChangeHandler));
@@ -49,23 +58,19 @@ export class PDFDocument extends Disposable implements CustomDocument {
     return this._uri;
   }
 
+  /** Called by the provider right before it writes to {@link uri}. */
+  suppressNextFileChange(): void {
+    this._suppressNextChange = true;
+  }
+
   private readonly _onDidDelete = this._register(new EventEmitter<Uri>());
-  /**
-   * Fired when the document is deleted.
-   */
+  /** Fired when the document is deleted. */
   readonly onDidDelete = this._onDidDelete.event;
 
   private readonly _onDidChange = this._register(new EventEmitter<Uri>());
-  /**
-   * Fired to notify webviews that the document has changed.
-   */
+  /** Fired to notify webviews that the document changed on disk. */
   readonly onDidChange = this._onDidChange.event;
 
-  /**
-   * Called by VS Code when there are no more references to the document.
-   *
-   * This happens when all editors for it have been closed.
-   */
   override dispose(): void {
     this._onDidDelete.fire(this.uri);
     super.dispose();
